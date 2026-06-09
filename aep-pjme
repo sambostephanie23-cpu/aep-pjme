@@ -1,0 +1,149 @@
+WITH energy_clean AS (
+    SELECT 
+        datetime,
+        AEP_MW AS megawatt,
+        'AEP' AS region
+    FROM `environmental-esg.oil_production.AEP`
+
+    UNION ALL
+
+    SELECT 
+        datetime,
+        PJME_MW AS megawatt,
+        'PJME' AS region
+    FROM `environmental-esg.oil_production.PJME`
+),
+
+
+daily_energy AS (
+    SELECT
+        region,
+        DATE(datetime) AS energy_date,
+        SUM(megawatt) AS daily_total_mw,
+        AVG(megawatt) AS daily_avg_mw,
+        MAX(megawatt) AS daily_peak_mw
+    FROM energy_clean
+    GROUP BY region, DATE(datetime)
+),
+
+
+grid_daily_comparison AS (
+    SELECT
+        energy_date,
+        SUM(CASE WHEN region = 'PJME' THEN daily_total_mw END) AS pjme_daily,
+        SUM(CASE WHEN region = 'AEP' THEN daily_total_mw END) AS aep_daily,
+
+        SUM(CASE WHEN region = 'PJME' THEN daily_total_mw END)
+        - SUM(CASE WHEN region = 'AEP' THEN daily_total_mw END) AS daily_diff,
+
+        SAFE_DIVIDE(
+            ABS(SUM(CASE WHEN region = 'PJME' THEN daily_total_mw END)
+            - SUM(CASE WHEN region = 'AEP' THEN daily_total_mw END)),
+            (SUM(CASE WHEN region = 'PJME' THEN daily_total_mw END)
+            + SUM(CASE WHEN region = 'AEP' THEN daily_total_mw END)) / 2
+        ) * 100 AS pct_difference
+    FROM daily_energy
+    GROUP BY energy_date
+),
+
+
+rolling_metrics AS (
+    SELECT
+        region,
+        datetime,
+        megawatt,
+
+        AVG(megawatt) OVER (
+            PARTITION BY region
+            ORDER BY datetime
+            ROWS BETWEEN 24 PRECEDING AND CURRENT ROW
+        ) AS rolling_24h_avg,
+
+        AVG(megawatt) OVER (
+            PARTITION BY region
+            ORDER BY datetime
+            ROWS BETWEEN 168 PRECEDING AND CURRENT ROW
+        ) AS rolling_7d_avg
+    FROM energy_clean
+),
+
+anomalies AS (
+    SELECT
+        r.*,
+        CASE 
+            WHEN megawatt > rolling_24h_avg * 1.5 THEN 1
+            ELSE 0
+        END AS anomaly_flag
+    FROM rolling_metrics r
+),
+
+monthly_anomalies AS (
+    SELECT
+        region,
+        EXTRACT(YEAR FROM datetime) AS year,
+        EXTRACT(MONTH FROM datetime) AS month,
+        SUM(anomaly_flag) AS anomaly_count
+    FROM anomalies
+    GROUP BY region, year, month
+),
+
+
+ranked_monthly AS (
+    SELECT
+        region,
+        datetime,
+        megawatt,
+        EXTRACT(YEAR FROM datetime) AS year,
+        EXTRACT(MONTH FROM datetime) AS month,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY region, EXTRACT(YEAR FROM datetime), EXTRACT(MONTH FROM datetime)
+            ORDER BY megawatt DESC
+        ) AS rank_peak
+    FROM energy_clean
+),
+
+monthly_peaks AS (
+    SELECT
+        region,
+        year,
+        month,
+        datetime AS peak_time,
+        megawatt AS peak_value
+    FROM ranked_monthly
+    WHERE rank_peak = 1
+)
+
+
+SELECT
+    mp.region,
+    mp.year,
+    mp.month,
+    mp.peak_time,
+    mp.peak_value,
+
+    ma.anomaly_count,
+
+    rm.rolling_24h_avg,
+    rm.rolling_7d_avg,
+
+    gd.pjme_daily,
+    gd.aep_daily,
+    gd.daily_diff,
+    gd.pct_difference
+
+FROM monthly_peaks mp
+
+LEFT JOIN monthly_anomalies ma
+    ON mp.region = ma.region
+    AND mp.year = ma.year
+    AND mp.month = ma.month
+
+LEFT JOIN rolling_metrics rm
+    ON mp.region = rm.region
+    AND DATE(mp.peak_time) = DATE(rm.datetime)
+
+LEFT JOIN grid_daily_comparison gd
+    ON DATE(mp.peak_time) = gd.energy_date
+
+ORDER BY mp.region, mp.year, mp.month;
